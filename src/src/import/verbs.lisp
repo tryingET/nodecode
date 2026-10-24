@@ -242,11 +242,14 @@ reader (NLK:READ-EVENTS) skips and its socket counts as a line."
                            (bt2:with-lock-held (lock)
                              (setf open nil)
                              (funcall writer "" :close t)))
-          (event (nlk:json-object
-                  "type" "result" "result"
-                  (funcall run (lambda (phase item)
-                                 (event (nlk:json-object "type" "item" "phase" phase
-                                                         "item" (item-json item))))))))))))
+          (let ((result (funcall run (lambda (phase item)
+                                      (event (nlk:json-object "type" "item" "phase" phase
+                                                              "item" (item-json item)))))))
+            ;; Stop and drain the heartbeat before the terminal event: a ping
+            ;; already waiting on SEND's lock must never follow the result.
+            (bt2:signal-semaphore done)
+            (bt2:join-thread pinger)
+            (event (nlk:json-object "type" "result" "result" result))))))))
 
 (defun import-route (env &aux (request (nle::gateway-request-json env))
                                (method (nlk:json-value request :string "method")))

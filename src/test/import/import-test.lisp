@@ -1126,26 +1126,80 @@
       (is (equal "/work/app" (string-right-trim "/" (nik::record-cwd record))) "its own folder, not the launch's")
       (is (equal '("fix the build") (mapcar (lambda (exchange) (getf exchange :input)) (nik::record-exchanges record))) "the inline sidechain pair is no exchange of it"))))
 
-(deftest a-streamed-import-pings-while-it-works (let ((writes '()) (closed nil) (lock (bt2:make-lock :name "t"))))
-  ;; T-350: a plan of a large home read in silence past the shell's 30 s
-  ;; read. The stream says it is working every *STREAM-PING-SECONDS* -- a
-  ;; comment NLK:READ-EVENTS skips -- ends on the result, and writes nothing
-  ;; once closed.
+(deftest a-streamed-import-pings-while-it-works
+    (let ((writes '()) (closed nil) (pinger nil) (live-at-result nil)
+          (entered (bt2:make-semaphore :name "heartbeat-entered"))
+          (release (bt2:make-semaphore :name "heartbeat-release"))))
+  ;; Given a heartbeat held inside the writer while RUN prepares to return,
+  ;; When RUN releases it and returns, the producer must be joined before
+  ;; the result writer is called. Timeouts bound fixture failures only: no
+  ;; sleep or assumed number of scheduler turns establishes this ordering.
   (flet ((responder (status)
            (declare (ignore status))
            (lambda (text &key close)
-             (bt2:with-lock-held (lock)
-               (when closed (push :after-close writes))
-               (if close (setf closed t) (push text writes))))))
-    (let ((nik::*stream-ping-seconds* 0.05))
-      (nik::stream-import #'responder
-                          (lambda (progress)
-                            (declare (ignore progress))
-                            (sleep 0.4)
-                            (nlk:json-object "summary" "read")))))
+             (when closed (push :after-close writes))
+             (cond (close (setf closed t))
+                   (t
+                    (push text writes)
+                    (when (and (null pinger) (search ": working" text))
+                      (setf pinger (bt2:current-thread))
+                      (bt2:signal-semaphore entered)
+                      (unless (bt2:wait-on-semaphore release :timeout 5)
+                        (error "heartbeat release timed out")))
+                    (when (search "\"type\":\"result\"" text)
+                      (setf live-at-result (bt2:thread-alive-p pinger))))))))
+    (let ((nik::*stream-ping-seconds* 0.01))
+      (unwind-protect
+           (nik::stream-import
+            #'responder
+            (lambda (progress)
+              (funcall progress "read" (nik::make-item :kind "memory" :status "imported"))
+              (unless (bt2:wait-on-semaphore entered :timeout 5)
+                (error "heartbeat did not enter the writer"))
+              (bt2:signal-semaphore release)
+              (nlk:json-object "summary" "read")))
+        (bt2:signal-semaphore release))))
   (let ((writes (reverse writes)))
     (is closed)
     (is (not (member :after-close writes)) "nothing after the close")
-    (is (<= 3 (count-if (lambda (text) (and (stringp text) (search ": working" text))) writes)) "pinged while it read")
+    (is (some (lambda (text) (and (stringp text) (search ": working" text))) writes) "pinged while it read")
+    (is (some (lambda (text) (and (stringp text) (search "\"type\":\"item\"" text))) writes) "progress still streams")
+    (is (not live-at-result) "the heartbeat producer is joined before the result writer")
+    (is (not (bt2:thread-alive-p pinger)) "the heartbeat producer is gone on return")
     (is (search "\"type\":\"result\"" (car (last writes))) "the result closes it")
     (is (search "\"summary\":\"read\"" (car (last writes))))))
+
+(deftest a-failed-streamed-import-stops-its-heartbeat ()
+  ;; Both RUN and its progress writer can fail. Cleanup must still join the
+  ;; producer and close exactly once, without manufacturing a success result.
+  (dolist (failure '(:run :writer))
+    (let ((entered (bt2:make-semaphore :name "heartbeat-seen"))
+          (pinger nil) (closes 0) (after-close nil) (result nil) (caught nil))
+      (flet ((responder (status)
+               (declare (ignore status))
+               (lambda (text &key close)
+                 (when (plusp closes) (setf after-close t))
+                 (cond (close (incf closes))
+                       ((search ": working" text)
+                        (setf pinger (bt2:current-thread))
+                        (bt2:signal-semaphore entered))
+                       ((search "\"type\":\"result\"" text) (setf result t))
+                       ((eq failure :writer) (error "fixture writer failure"))))))
+        (let ((nik::*stream-ping-seconds* 0.01))
+          (handler-case
+              (nik::stream-import
+               #'responder
+               (lambda (progress)
+                 (unless (bt2:wait-on-semaphore entered :timeout 5)
+                   (error "heartbeat did not start"))
+                 (if (eq failure :run)
+                     (error "fixture run failure")
+                     (funcall progress "read" (nik::make-item :kind "memory" :status "imported")))))
+            (simple-error (condition)
+              (setf caught (search (if (eq failure :run) "fixture run failure" "fixture writer failure")
+                                   (princ-to-string condition)))))))
+      (is caught "the originating failure escapes")
+      (is (= 1 closes) "cleanup closes exactly once")
+      (is (and pinger (not (bt2:thread-alive-p pinger))) "cleanup joins the heartbeat producer")
+      (is (not after-close) "no writer is called after close")
+      (is (not result) "failure does not publish a result"))))
