@@ -777,6 +777,60 @@ fasl: another process at the cache under the load."
             (is (zerop compiles) "the next load compiles nothing again")
             (is (eql 1 (evolved-fn "CELLS-PROBE-REBIND")) "and still rebinds")))))))
 
+(deftest cells-layer-recompiles-fasl-when-struct-layout-changes (with-cell-fixture (root))
+  ;; Scenario (Gherkin / AK9249):
+  ;;   Given a layer file cached as a FASL against a 2-slot defstruct
+  ;;   When the peripheral defstruct grows to 3 slots (incompatible layout) and the layer loads
+  ;;   Then load-layer-fasl recompiles the stale FASL against the live layout, loads with zero failures,
+  ;;   and subsequent boots hit the refreshed FASL without recompiling.
+  (let* ((pkg (find-package '#:nodecode.evolved))
+         (struct-sym (intern "CELLS-PROBE-LAYOUT-STRUCT" pkg))
+         (slot-a (intern "A" pkg))
+         (slot-b (intern "B" pkg))
+         (slot-c (intern "C" pkg))
+         (acc-a (intern "CELLS-PROBE-LAYOUT-STRUCT-A" pkg))
+         (ctor (intern "MAKE-CELLS-PROBE-LAYOUT-STRUCT" pkg)))
+    (flet ((define-struct (slots)
+             (let ((*package* pkg))
+               (handler-bind ((warning #'muffle-warning)
+                              (error (lambda (condition)
+                                       (declare (ignore condition))
+                                       (nlk:when-let (r (find-restart 'continue))
+                                         (invoke-restart r)))))
+                 (eval `(defstruct ,struct-sym ,@slots)))))
+           (forget ()
+             (dolist (name '("CELLS-PROBE-LAYOUT-USE" "CELLS-PROBE-LAYOUT-STRUCT"
+                             "MAKE-CELLS-PROBE-LAYOUT-STRUCT" "COPY-CELLS-PROBE-LAYOUT-STRUCT"
+                             "CELLS-PROBE-LAYOUT-STRUCT-P" "CELLS-PROBE-LAYOUT-STRUCT-A"
+                             "CELLS-PROBE-LAYOUT-STRUCT-B" "CELLS-PROBE-LAYOUT-STRUCT-C"))
+               (nlk:when-let (sym (find-symbol name pkg))
+                 (ignore-errors (fmakunbound sym))))))
+      (nlk:with-cleanup ((forget))
+        (with-layer-cache (cache "stamp-layout")
+          (define-struct (list slot-a slot-b))
+          (write-layer-folder
+           root "nl-layout"
+           `(("use" . ,(format nil "(defun cells-probe-layout-use (x) (~a x))" acc-a))))
+          (let ((source (merge-pathnames "nl-layout/use.lisp" root)))
+            (let ((*error-output* (make-broadcast-stream)))
+              (nlk::muffled-load
+               (lambda ()
+                 (nlk::compile-layer-file
+                  source (ensure-directories-exist (nlk::layer-fasl-path source))))))
+            (is (probe-file (nlk::layer-fasl-path source)) "stale 2-slot fasl exists in layer cache"))
+          (define-struct (list slot-a slot-b slot-c))
+          (load-cell-fixture root)
+          (is-carrying (text (nlk:cells-folder-text))
+            (:absent "FAILED" "stale struct-layout fasl recovered without failure"))
+          (let ((inst (funcall ctor :a 42 :b 1 :c 2)))
+            (is (eql 42 (evolved-fn "CELLS-PROBE-LAYOUT-USE" inst)) "recompiled layer reads live 3-slot struct"))
+          (let ((compiles 0))
+            (with-stubbed-fdefinition (nlk::compile-layer-file (source fasl)
+                                       (incf compiles)
+                                       (funcall original source fasl))
+              (load-cell-fixture root)
+              (is (zerop compiles) "next boot hits refreshed 3-slot fasl with zero recompiles"))))))))
+
 (deftest cells-layer-compile-takes-only-the-files-it-claims ()
   ;; A worker compiles the files whose claim — one MKDIR under CLAIMS — it
   ;; wins, and marks a compile that published nothing `failed', where the

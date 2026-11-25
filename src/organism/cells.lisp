@@ -1990,11 +1990,22 @@ when it loaded, the reason it was skipped, as the boot line prints it, or
                 (t (if fasl (load-layer-fasl fasl path) (load path))
                    nil)))))))
 
+(defun stale-layer-fasl-error-p (condition)
+  "Whether CONDITION from LOAD of a cached layer FASL indicates binary staleness
+against the live image (invalid FASL or incompatible peripheral STRUCTURE-OBJECT
+layout after a peripheral cell upgraded a defstruct) rather than a source bug."
+  (or (typep condition 'sb-ext:invalid-fasl)
+      (and (typep condition 'simple-error)
+           (let ((text (princ-to-string condition)))
+             (and (search "STRUCTURE-OBJECT" text)
+                  (search "incompatibly" text))))))
+
 (defun load-layer-fasl (fasl path)
   "LOAD FASL, PATH's compiled form. A FASL gone before it opens — the cache
-cleared under this load — is compiled again into place and loaded, or PATH
-loaded from source when that compile fails."
-  (when (block vanished
+cleared under this load — or stale against a changed peripheral defstruct layout
+is compiled again into place and loaded, or PATH loaded from source when that
+compile fails."
+  (when (block reload
           (handler-bind ((file-error
                            (lambda (condition)
                              ;; the open of FASL itself, never an error its own forms signal
@@ -2002,7 +2013,11 @@ loaded from source when that compile fails."
                                         (ignore-errors
                                          (uiop:pathname-equal (pathname (file-error-pathname condition))
                                                               fasl)))
-                               (return-from vanished t)))))
+                               (return-from reload t))))
+                         (error
+                           (lambda (condition)
+                             (when (stale-layer-fasl-error-p condition)
+                               (return-from reload t)))))
             (load fasl)
             nil))
     (load (or (ignore-errors (ensure-directories-exist fasl) (compile-layer-file path fasl))
