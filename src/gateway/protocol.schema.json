@@ -490,7 +490,7 @@
         },
         {
           "if": { "properties": { "type": { "const": "organism.cells" } } },
-          "then": { "required": ["names"], "properties": { "names": { "type": "array" } } }
+          "then": { "required": ["names"], "properties": { "names": { "type": "array" }, "action": { "enum": ["start", "stop", "restart", "sync"] } } }
         },
         {
           "if": { "properties": { "type": { "const": "organism.loaded" } } },

@@ -2511,6 +2511,9 @@ position (the cursor a resume names), the target its next turn binds
                   ;; pending that a withdrawal took back -- running or not.
                   (when-let (queue (newest-queue-snapshot sid))
                     (send-frame-under-lock gws peer "session_input_queue_snapshot_updated" queue)))))))
+      ;; Outside the session locks: a cell start may itself publish session
+      ;; frames while holding the lifecycle lock. Repeated SYNC is idempotent.
+      (send-shell-cells-state peer)
       ;; The running-session map rides the first subscription,
       ;; whole, once the peer is on its sessions so its own reads as
       ;; attached: a shell's copy is its own table, not transcript
@@ -4950,6 +4953,22 @@ One thread per folder; none outside a serving gateway."
                                   (refresh-attached-command-catalogs)
                                   (broadcast-model-changed))))))))))
 
+(defun shell-cells-state-payload (&optional names (action "sync"))
+  "Terminal lifecycle state, sent live and once when a shell first attaches."
+  (json-object "action" action "names"
+               (coerce (loop for cell in (nlk:cells)
+                             when (and (cell-selected-p cell names)
+                                       (or (equal action "stop")
+                                           (and cell.started-p (null cell.refusal))))
+                               collect cell.name) 'vector)))
+
+(defun send-shell-cells-state (peer)
+  ;; The snapshot and enqueue share the mutation lock: an OFF cannot be
+  ;; queued between taking this snapshot and sending it, then be undone by it.
+  (bt2:with-lock-held (*cells-lifecycle-lock*)
+    (enqueue-peer-frame peer (nlk:encode-unsequenced-frame "organism.cells"
+                                                        (shell-cells-state-payload)))))
+
 (defun %start-cells (names)
   (multiple-value-bind (config error-text) (read-shared-config)
     ;; A member the file holds and nothing reads -- a nested one spelled with
@@ -4983,10 +5002,14 @@ One thread per folder; none outside a serving gateway."
                   (notice (format nil "cell ~a not started: ~a" name condition)
                           :level :error :key name))
                 (setf cell.refusal text))
+              (broadcast-organism "organism.cells"
+                                  (json-object "action" "stop" "names" (vector name)))
               (unless (typep condition 'nlk:config-refusal)
-                (retry-cell-start name)))))))))
+                (retry-cell-start name))))))))
+  (broadcast-organism "organism.cells" (shell-cells-state-payload names "restart")))
 
 (defun %stop-cells (names)
+  (broadcast-organism "organism.cells" (shell-cells-state-payload names "stop"))
   (dolist (cell (reverse (nlk:cells)))
     (when (cell-selected-p cell names)
       (when cell.started-p

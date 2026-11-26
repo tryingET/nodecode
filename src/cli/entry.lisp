@@ -230,7 +230,10 @@ recomposes over the cached projection, and a toast is the frame's overlay."
   ;; struct's own auto-generated id.
   (format nil "s-~36r" (random (expt 36 8) (make-random-state t))))
 
-(defun call-with-profile-switch (program body &aux (performer nlk:*profile-switch-performer*))
+(defvar *shell-teardown-refusal* nil)
+
+(defun call-with-profile-switch (program body &aux (performer nlk:*profile-switch-performer*)
+                                                  (*shell-teardown-refusal* nil))
   "Run BODY — a whole shell, its teardown included — with the switch
 performer installed, then perform whatever switch BODY parked."
   ;; PROGRAM is the loop BODY runs, so a pick can end it. Both shells go
@@ -269,7 +272,15 @@ performer installed, then perform whatever switch BODY parked."
                    (format nil "switching to ~a: this shell comes back in that home" name)))
            (funcall body))
     (let ((pending nlk:*profile-switch-parked*))
-      (when (and pending performer)
+      (cond
+        (*shell-teardown-refusal*
+         ;; BODY already ran every independent teardown operation. A refused
+         ;; drain must never turn retained ownership into a claimed handover.
+         (setf nlk:*profile-switch-parked* nil nlt:*keep-terminal* nil)
+         (when pending (ignore-errors (nlt:release-terminal program)))
+         (format *error-output* "~&nodecode: ~a~%" *shell-teardown-refusal*)
+         (uiop:finish-outputs))
+        ((and pending performer)
         ;; Consumed: one plan, one exec. A refused exec leaves an image with
         ;; nothing parked rather than half-switched.
         (setf nlk:*profile-switch-parked* nil)
@@ -283,7 +294,7 @@ performer installed, then perform whatever switch BODY parked."
           (setf nlt:*keep-terminal* nil)
           (ignore-errors (nlt:release-terminal program))
           (format *error-output* "~&nodecode: ~a~%" refusal)
-          (uiop:finish-outputs))))))
+          (uiop:finish-outputs)))))))
 
 ;;;; --- the startup owner ---------------------------------------------------
 ;;;;

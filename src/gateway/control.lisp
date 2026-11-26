@@ -581,7 +581,6 @@ installs do not fit the deadline SECONDS leaves them."
                                            (install-and-load-cell each offers))))
             (push each done)))))
   (start-cells names)
-  (broadcast-organism "organism.cells" (json-object "names" (coerce names 'vector)))
   (let ((record (nlk:find-cell name)))
     (destructuring-bind (&optional from to loaded) moved
       (format nil "~@[~{~a moved from ~a to ~a~}; ~]~a is on~@[, with ~{~a~^, ~}~]~:[~;; ~:*~{~a~^; ~}; the next restart loads it again~]~@[; it did not start: ~a~]~@[; it runs ~a until the next restart~]"

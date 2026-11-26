@@ -246,19 +246,11 @@ thread reads it and clears this place.")
                                                       :opt "call_id" call-id)))))))
                 (render-state model))))
            ((string= kind "organism.cells")
-            ;; The organism turned folders on (SWITCH-CELL-ON): this shell
-            ;; loads the same ones, as its boot would have, so its /cells
-            ;; lists them and their code that runs in a shell runs here. It
-            ;; starts no peripheral -- the organism runs those. Live-only.
-            ;; Off the loop, as the boot's own load is. Without this, the
-            ;; import folder's load would hold the setup walk's panel past
-            ;; the import it waits for. A failed load is on the folder's
-            ;; record, which /cells reads.
+            ;; Only the terminal half starts here. Intention is recorded on
+            ;; receipt before an off-loop load can race a later OFF.
             (when-let (names (json-value payload :array "names"))
-              (off-loop model
-                        (lambda ()
-                          (apply #'nlk:load-cell (remove-if-not #'stringp (coerce names 'list))))
-                        (constantly :quiet))))
+              (request-shell-cell-action model (coerce names 'list)
+                                         (or (json-value payload :string "action") "start"))))
            ((string= kind "organism.upgraded")
             ;; The organism's image moved to a staged release and reads
             ;; itself from a new tree (ANNOUNCE-UPGRADED): this shell

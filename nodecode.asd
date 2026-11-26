@@ -383,6 +383,7 @@ of stacking."
      ;; update, the organism it fronts, the slash commands it runs
      ;; (tui/commands/), and the sessions it lists and attaches to.
      (:file "client/client")
+     (:file "client/cell-lifecycle")
      (:file "client/client-update")
      (:file "client/client-boot")
      (:file "tui/commands/bare")
@@ -746,6 +747,11 @@ of stacking."
      ;; control-cells-test follows cells-test: it writes its scratch
      ;; release with that file's folder and hub-index writers.
      (:file "gateway/control-cells-test")
+     (:file "client/cell-lifecycle-test")
+     (:file "client/cell-lifecycle-retry-test")
+     (:file "client/cell-lifecycle-quiescence-test")
+     (:file "client/cell-lifecycle-scope-test")
+     (:file "client/cell-lifecycle-intent-test")
      ;; provider-offers-test follows control-cells-test: it clones with
      ;; cells-test's hub fixtures and opens ui-test's frame-model wizard.
      (:file "gateway/provider-offers-test")

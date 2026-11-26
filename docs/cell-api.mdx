@@ -459,13 +459,78 @@ The key hint shows on the row's right while the composer is empty, which is when
 </Mistakes>
 
 {/* source: src/organism/cell-dsl.lisp */}
+## Terminal-shell contributions
+
+A cell's gateway half and terminal half run in separate processes. Use
+`:shell-start` for terminal hooks or workers, not a top-level `hook` or thread:
+
+```lisp
+(:shell-start
+  (lambda (settings model)
+    ;; SETTINGS is this shell's typed section plist; MODEL is its native UI model.
+    (let ((worker (nlk:worker-start "weather shell" (lambda () nil))))
+      (nle:on-stop
+       (lambda ()
+         (nlk:worker-stop worker :timeout 5)
+         (when (bt2:thread-alive-p (nlk:worker-thread worker))
+           (error "Weather worker is still draining; retry cleanup.")))))))
+```
+
+The declaration exports `START-SHELL-CELL(config model)` and
+`STOP-SHELL-CELL(&optional model)`. Source loading only defines these entry points;
+terminal startup runs the shell callback inside a retryable, model-owned scope,
+registered before any acquisition. The callback receives settings explicitly:
+gateway `setting` and `*WEATHER*` are not terminal state. The returned stop function
+owns exactly that model generation; an old stop cannot stop its replacement. A
+direct `stop-shell-cell` with no model attempts every terminal scope in that process.
+
+The shell reconciles native cell enable, disable and config-restart events, and
+unwinds its scopes before closing its connection or handing over a profile.
+Repeated starts replace rather than duplicate a model's resources. An OFF or exit
+received while code loads invalidates that pending start; a failed callback rolls
+back its acquisitions and does not prevent sibling cells from running. Reconnect
+receives the gateway's complete desired set without restarting surviving scopes.
+A requested configuration replacement remains owed across newer start/sync
+messages and configuration-read or dispatch failures, until a current acquisition
+succeeds. OFF cancels it. Terminal teardown permanently closes that model's
+lifecycle authority: a delayed notification cannot recreate its manager; a new
+terminal uses a new model. A sandboxed shell does not load or start these
+contributions.
+
+Call `on-stop` immediately after every acquisition. Cleanup must actually quiesce
+a worker before returning; a requested stop or timeout alone is not evidence that
+it exited. Signal an error when cleanup is incomplete. Successful inverses are
+removed; failed inverses remain owned and are retried on the next stop, start or
+sync. Cleanup failures do not skip sibling inverses or other model scopes. A
+failed acquisition whose rollback also fails retains its stop handle in the
+shell manager, including when OFF races that acquisition. A replacement cannot
+start until that cleanup succeeds. Stop callbacks must return or signal within a
+bounded interval: the lifecycle manager cannot preempt a hanging callback.
+Acquisition and cleanup serialize per terminal model, not across the cell's
+models. Recursive START/STOP during that same scope's acquisition or cleanup is
+refused before ownership changes. A direct STOP encountering a busy acquisition
+also refuses promptly and remains retryable; it does not imply quiescence.
+Independent inverses are attempted even when one fails. If one resource must
+remain alive until another quiesces, put their ordered cleanup in a single
+retryable inverse; do not rely on a failed inverse stopping sibling cleanup.
+The terminal also tracks queued and running lifecycle actions before dispatch.
+`stop-shell-cells` reports success only after those actions drain and every
+resource inverse succeeds. A bounded drain timeout or incomplete cleanup retains
+the manager and reports the remaining work; it is not successful shutdown.
+Independent terminal teardown still runs, but a profile handover refuses to
+launch the next profile until shell-cell quiescence has been observed. A stale
+action's failure cannot overwrite the state of a newer request.
+
+This stricter shell contract does not change gateway `starting` cleanup semantics.
+A cell that needs no terminal behavior should omit this clause.
+
 ## Stop
 
 | Property | Detail |
 | --- | --- |
 | Complete | Stop takes back exactly what start put in. |
 | Idempotent | A second stop does nothing. |
-| A start that fails halfway | Leaves nothing. Sibling cells still start. |
+| A start that fails halfway | Unwinds its acquisitions; failed terminal cleanup stays owned for retry. Sibling cells still start. |
 | A second start | Stops the first one. One of everything remains. |
 
 When the declaration does not fit, write `START-CELL` by hand from the same pieces:

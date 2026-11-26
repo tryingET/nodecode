@@ -1060,6 +1060,7 @@ nodecode manually"
        ;; the teardown below let go of the organism this shell started.
        (lambda (&aux (quit nil))
          (with-cleanup ((setf stop t) (bt2:signal-semaphore ingress-slots :count 256)
+                        (note-shell-cell-shutdown model)
                         (gateway-link-close model.ws)
                         ;; The organism this shell started goes with it, as it did
                         ;; when it ran inside it: join the boot (bounded -- it may
@@ -1074,6 +1075,7 @@ nodecode manually"
                         (stop-front :why (and quit "quit")
                                     :wait (not nlk:*profile-switch-parked*))
                         (close-shell-presence))
+           (unless *sandboxed-shell* (start-shell-cells model))
            (call-with-severed-stdio (stdio-log-path store-path)
              (lambda ()
                (call-with-tui-error-capture prog

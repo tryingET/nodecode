@@ -608,7 +608,12 @@ so the payload need not carry the token again."
             (multiple-value-bind (rows present) (gethash "rows" payload)
               (when present (required-array nil "organism.notices rows" rows))))
            ("organism.note" (required-string payload "text"))
-           ("organism.cells" (required-array nil "organism.cells names" (gethash "names" payload)))
+           ("organism.cells"
+            (required-array nil "organism.cells names" (gethash "names" payload))
+            (multiple-value-bind (action present) (gethash "action" payload)
+              (when (and present
+                         (not (member action '("start" "stop" "restart" "sync") :test #'equal)))
+                (protocol-refuse :invalid-envelope "organism.cells action is invalid"))))
            ("organism.activity"
             (required-array nil "organism.activity sessions" (gethash "sessions" payload)))
            ("organism.loaded"

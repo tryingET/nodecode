@@ -51,6 +51,15 @@
 
 (in-package #:nodecode.evolved)
 
+(defvar *cell-settings-context* :configuration
+  "Native reader purpose: :CONFIGURATION normally, :SHELL only while reading
+an attached terminal's settings. Availability remains the gateway's authority.")
+
+(defun cell-settings-context ()
+  "The native settings-reader purpose; not inferred from process startup flags."
+  *cell-settings-context*)
+
+
 ;;; --- a registration scope -------------------------------------------------
 
 ;;; DEFVAR, not
@@ -111,6 +120,89 @@ that signals does not strand the rest."
   ;;     (take-the-lease)
   ;;     (nle:on-stop #'release-the-lease))
   `(call-starting (lambda () ,@body)))
+
+;;; Shell cleanup is stricter than the historical gateway STARTING contract.
+;;; A failed worker join is ownership still held, not evidence of quiescence.
+(define-condition shell-cell-startup-cleanup-error (error)
+  ((stop :initarg :stop :reader shell-cell-startup-cleanup-stop)
+   (cause :initarg :cause :reader shell-cell-startup-cleanup-cause))
+  (:report (lambda (condition stream)
+             (declare (ignore condition))
+             (write-string "shell cell startup failed; cleanup remains pending" stream))))
+
+(defun run-shell-stops (scope)
+  "Try every inverse; remove only successes and retain failures for retry."
+  (let ((failures 0))
+    ;; The snapshot makes one pass; a non-local exit also leaves its current
+    ;; and unattempted inverses in SCOPE. Repeated equal closures count separately.
+    (dolist (fn (copy-list (car scope)))
+      (handler-case
+          (progn (funcall fn)
+                 (setf (car scope) (delete fn (car scope) :test #'eq :count 1)))
+        (error () (incf failures))))
+    (when (plusp failures)
+      (error "shell scope retains ~d failed cleanup operation~:p" failures)))
+  t)
+
+(defstruct shell-scope-control
+  (lock (bt2:make-recursive-lock :name "shell model scope"))
+  phase)
+
+(defun shell-scope-control-for (controls lock model)
+  ;; Weak keys retain one lock across generations without keeping stopped models.
+  (bt2:with-recursive-lock-held (lock)
+    (or (gethash model controls)
+        (setf (gethash model controls) (make-shell-scope-control)))))
+
+(defun shell-scope-stops (registry lock model)
+  "Snapshot ownership under the registry lock; never call inverses under it."
+  (bt2:with-recursive-lock-held (lock)
+    (if model
+        (when-let (stop (gethash model registry)) (list stop))
+        (loop for stop being the hash-values of registry collect stop))))
+
+(defun call-shell-starting (registry lock control model thunk)
+  "Register MODEL's retryable scope before THUNK; caller owns its model lock."
+  (let ((scope (list nil)) (finished nil) (stop nil))
+    (setf stop
+          (lambda ()
+            ;; A direct caller may stop during acquisition outside the manager.
+            ;; Refuse promptly; waiting here would bypass the manager's deadline.
+            (unless (bt2:with-recursive-lock-held
+                        ((shell-scope-control-lock control) :timeout 0)
+                      ;; An old stop cannot affect a replacement generation.
+                      (when (bt2:with-recursive-lock-held (lock)
+                              (eq (gethash model registry) stop))
+                        (when (shell-scope-control-phase control)
+                          (error "shell scope cannot stop reentrantly during ~a"
+                                 (shell-scope-control-phase control)))
+                        (setf (shell-scope-control-phase control) :stopping)
+                        (unwind-protect
+                             (progn (run-shell-stops scope)
+                                    (bt2:with-recursive-lock-held (lock)
+                                      (remhash model registry)))
+                          (setf (shell-scope-control-phase control) nil)))
+                      t)
+              ;; Busy only matters while this generation still owns anything.
+              ;; A stale stop remains inert even during replacement acquisition.
+              (when (bt2:with-recursive-lock-held (lock)
+                      (eq (gethash model registry) stop))
+                (error "shell model scope is busy; retry cleanup")))
+            t))
+    (bt2:with-recursive-lock-held (lock) (setf (gethash model registry) stop))
+    (setf (shell-scope-control-phase control) :starting)
+    (unwind-protect
+         (let ((*registrations* scope))
+           (funcall thunk)
+           (setf finished t))
+      ;; Rollback is not reentrant acquisition: the acquiring callback has left.
+      (setf (shell-scope-control-phase control) nil)
+      (unless finished
+        (handler-case (funcall stop)
+          (error (condition)
+            ;; The manager must acquire this inverse even though START refused.
+            (error 'shell-cell-startup-cleanup-error :stop stop :cause condition)))))
+    stop))
 
 ;;; --- one cell, declared -------------------------------------------------
 
@@ -223,6 +315,10 @@ all of it comes back off."
   ;;   (:route PATH FN &key public)   ROUTE: PATH answered on the gateway's
   ;;       own port to the operator's token, to anyone under PUBLIC, a PATH
   ;;       ending in / everything under it; stop takes it back.
+  ;;   (:shell-start FUNCTION)   (lambda (SETTINGS MODEL) ...), run only in
+  ;;       an attached terminal shell, inside its own STARTING scope. SETTINGS
+  ;;       is an independent section plist; ON-STOP records shell cleanup.
+  ;;       Defines START-SHELL-CELL(config model) and STOP-SHELL-CELL(&optional model).
   ;;   (:start FUNCTION)   (lambda () ...), run inside the scope with the
   ;;       settings variable already set: everything no clause covers — a directory,
   ;;       a worker, a lease. Call ON-STOP there for its inverse.
@@ -241,6 +337,12 @@ all of it comes back off."
          (stop-variable (intern "*STOP*" package))
          (start-cell (intern "START-CELL" package))
          (stop-cell (intern "STOP-CELL" package))
+         (shell-start (intern "START-SHELL-CELL" package))
+         (shell-stop (intern "STOP-SHELL-CELL" package))
+         (shell-stops (intern "*SHELL-STOPS*" package))
+         (shell-lock (intern "*SHELL-LOCK*" package))
+         (shell-controls (intern "*SHELL-CONTROLS*" package))
+         (shell-forms '())
          (settings (gensym "SETTINGS"))
          (hooks '())
          (path nil)
@@ -291,6 +393,10 @@ all of it comes back off."
             (:route
              (destructuring-bind (at fn &key public &aux (it (gensym "PATH"))) arguments
                (contribute `((,it ,at)) `(route ,it ,fn :public ,public) `(route ,it nil))))
+            (:shell-start
+             (unless (= 1 (length arguments))
+               (error "define-cell ~s: :shell-start needs one function" name))
+             (push `(funcall ,(first arguments) ,settings model) shell-forms))
             (:start (push `(funcall ,(first arguments)) forms))))))
     (unless path
       (error "define-cell ~s: a (:section (PATH...) ...) clause is required" name))
@@ -334,4 +440,36 @@ loader's one loud warning; a start that fails halfway leaves nothing registered.
                        (on-stop (lambda () (setf ,variable nil)))
                        ,@(nreverse forms))))))
          #',stop-cell)
+       ,@(when shell-forms
+           `((export '(,shell-start ,shell-stop) ,(package-name package))
+             (defvar ,shell-stops (make-hash-table :test #'eq))
+             (defvar ,shell-lock (bt2:make-recursive-lock :name ,(format nil "~a shell registry" key)))
+             (defvar ,shell-controls (make-hash-table :test #'eq :weakness :key))
+             (defun ,shell-stop (&optional model)
+               "Undo MODEL, or all models; busy or failed scopes stay owned for retry."
+               (let ((failures 0))
+                 (dolist (stop (shell-scope-stops ,shell-stops ,shell-lock model))
+                   (handler-case (funcall stop)
+                     (error () (incf failures))))
+                 (when (plusp failures)
+                   (error "~d shell scope~:p still own cleanup" failures)))
+               t)
+             (defun ,shell-start (config model)
+               "Start this terminal scope; refuse reentry before touching ownership."
+               (let ((control (shell-scope-control-for ,shell-controls ,shell-lock model)))
+                 (bt2:with-recursive-lock-held ((shell-scope-control-lock control))
+                   (when (shell-scope-control-phase control)
+                     (error "shell scope cannot start reentrantly during ~a"
+                            (shell-scope-control-phase control)))
+                   (,shell-stop model)
+                   (let ((table (section-table config ',path)))
+                     (if (section-enabled-p table)
+                         (call-shell-starting
+                          ,shell-stops ,shell-lock control model
+                          (lambda ()
+                            (let ((,settings
+                                    (let ((*cell-settings-context* :shell))
+                                      (section-settings (find-section ',path) table))))
+                              ,@(nreverse shell-forms))))
+                         (lambda () t))))))))
        ',name)))
