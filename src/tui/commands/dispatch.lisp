@@ -188,6 +188,8 @@ verdict on the pin (PROVIDER-TURN-REFUSAL), is laid out again."
   ;; this, a list landing after it left the previous list's verdict painted --
   ;; a cold launch's `provider claude-code is not one this box knows', read
   ;; before the cells started, stood after they had (the operator, 2026-10-22).
+  (unless (off-loop-failure value)
+    (finish-automatic-setup model))
   (cond ((off-loop-failure value) :quiet)
         ((home-screen-p model)
          (install-refreshed-models model)

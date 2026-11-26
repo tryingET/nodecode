@@ -89,20 +89,54 @@ does not hold: nothing seeds a shell's."
            (not (ignore-errors (default-model-configured-p))))
        t))
 
+(defvar *automatic-setup-pending* (make-hash-table :test #'eq :weakness :key)
+  "A first-launch decision awaiting gateway model facts, owned by the UI loop.")
+
+(defun automatic-setup-action (model)
+  "OPEN, SKIP or WAIT. A shell's absent local credentials prove no gateway failure.
+WAIT is unresolved, never evidence that credentials or a provider are ready."
+  (cond ((null *shared-config-path*) :skip)
+        ((not (ignore-errors (default-model-configured-p))) :open)
+        ((not (typep model 'gateway-chat-model))
+         (if (setup-required-p) :open :skip))
+        ;; Cell inventory and credential hooks belong to the gateway. The
+        ;; existing async /models read supplies its verdict without blocking init.
+        ((or (null *gateway-models*) (getf *gateway-models* :unreported)) :wait)
+        (t (let ((provider (shared-model-pin)))
+             (if (and provider
+                      (member provider (getf *gateway-models* :connected) :test #'string-equal)
+                      (not (assoc provider (getf *gateway-models* :refusals) :test #'string-equal)))
+                 :skip :open)))))
+
+(defun finish-automatic-setup (model)
+  "Resolve only our deferred first-launch decision; never replace an operator surface."
+  (when (gethash model *automatic-setup-pending*)
+    (let ((action (automatic-setup-action model)))
+      (unless (eq action :wait)
+        (remhash model *automatic-setup-pending*)
+        (when (and (eq action :open) (null model.dialog) (null model.setup-walk)
+                   (null model.setup-requested) (null model.composer-ask)
+                   (null model.selection) (composer-empty-p model))
+          (open-requested-setup model)
+          (render-state model))))))
+
 (defmethod nlt:init :after ((model chat-model))
-  "The first frame of a live shell opens the setup wizard when `setup' asked
-for it or when the provider/default model is missing, and paints it in."
+  "Explicit setup opens immediately; automatic setup waits for the gateway's facts."
   ;; A model without a program — a test's, a projection's — never opens it
-  ;; unasked.
-  (when (and model.program
-             (or model.setup-requested (setup-required-p)))
-    (open-requested-setup model)
-    (render-state model)))
+  ;; unasked. Deferred setup never performs network work on this UI thread.
+  (when model.program
+    (cond (model.setup-requested
+           (open-requested-setup model)
+           (render-state model))
+          (t (case (automatic-setup-action model)
+               (:wait (setf (gethash model *automatic-setup-pending*) t))
+               (:open (open-requested-setup model) (render-state model)))))))
 
 (defun open-requested-setup (model &aux (requested model.setup-requested))
   "Open what the launch asked for on the first frame: a channel's setup
 sheet for `nodecode gateway setup [CHANNEL]', which needs no model, else the
 setup walk."
+  (remhash model *automatic-setup-pending*)
   (cond ((and (consp requested) (eq (first requested) :channel-setup))
          (setf model.setup-requested nil)
          (open-channel-setup model (second requested)))
@@ -170,6 +204,7 @@ answer (NIK:RUN-SLASH)."
 (defun slash-setup-op (model)
   "/setup, nodecode setup and first launch share discovery/provider/model/effort.
 The explicit nodecode import request walks only the import stage."
+  (remhash model *automatic-setup-pending*)
   (let* ((requested model.setup-requested)
          (request (and (consp requested) (getf requested :import) requested))
          (run (make-setup-run :steps (unless request '(:provider :model :effort)))))
