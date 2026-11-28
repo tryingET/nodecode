@@ -9415,6 +9415,39 @@ signals is a decider that cannot be reached. Every other call goes out."
   (is-eval "(error \"plain\")"
     (:absent "calling" "an error that is not an arity error carries no callee")))
 
+(deftest eval-snippet-an-unknown-keyword-names-the-callee-and-its-keys ()
+  ;; SBCL names only the refused keyword, so the result names the ones the
+  ;; callee takes.
+  (nle:eval-string "(defun snippet-key-probe (a &key b ((:see c)) (d 1)) (list a b c d))")
+  (is-eval "(snippet-key-probe 1 :limit 3)"
+    ("Unknown &KEY argument: :LIMIT" result)
+    (", calling SNIPPET-KEY-PROBE, whose keywords are :b, :see, :d" "the keys it takes are named"))
+  (nle:eval-string "(defun snippet-nokey-probe (a &key) a)")
+  (is-eval "(snippet-nokey-probe 1 :limit 3)"
+    (", whose keywords are none" result))
+  (is-eval "(funcall (lambda (&key a) a) :b 1)"
+    (", calling (LAMBDA (&KEY A))" result)
+    (:absent "whose keywords" "an anonymous callee's keys are unknown, so none are claimed"))
+  (is-eval "(snippet-nokey-probe)"
+    (:absent "whose keywords" "an argument-count error lists no keywords"))
+  ;; A key that is not a keyword is written as the symbol it is.
+  (nle:eval-string "(defun snippet-plain-key-probe (a &key ((plain p) 2)) (list a p))")
+  (is-eval "(snippet-plain-key-probe 1 :plain 3)"
+    (", calling SNIPPET-PLAIN-KEY-PROBE, whose keywords are 'plain" result))
+  ;; Signalled from Lisp: the callee is the function that signalled, past the
+  ;; handler and ERROR, and one without &key claims no keywords.
+  (nle:eval-string "(defun snippet-signal-probe (x) (error 'sb-ext:unknown-keyword-argument :name :bad) x)")
+  (is-eval "(snippet-signal-probe 1)"
+    (", calling SNIPPET-SIGNAL-PROBE" result)
+    (:absent "whose keywords" "a function without &key claims none")
+    (:absent "NOTE-ARITY-CALLEE" "the handler's own frame is never the callee"))
+  ;; A frame whose keys hold the refused one is not the function that refused
+  ;; it (a local function compiled into its caller): no claim.
+  (is (null (nle::accepted-keywords 'nle::snippet-key-probe :b)))
+  (is (null (nle::accepted-keywords 'nle::snippet-signal-probe :bad)))
+  (is (equal ":b, :see, :d" (nle::accepted-keywords 'nle::snippet-key-probe :limit)))
+  (is (equal "none" (nle::accepted-keywords 'nle::snippet-nokey-probe :limit))))
+
 (deftest eval-value-a-multi-line-string-prints-as-text ()
   ;; A file, a listing, a command's output: read as text, not as a literal
   ;; with every quote escaped. One line keeps the REPL's quotes.

@@ -94,7 +94,7 @@ a verb the organism grows for itself is pushed here to be found.")
 
 Background evaluations. A form still running when yield_time_ms closes (default 10000, at most 600000) keeps evaluating in the background, never killed: the call answers {\"status\":\"running\",\"eval_id\":N} with the output so far, and as shell_output what its (sh ...) child has written: a command's capture is otherwise its value, read at its exit. Do not wait for it: go on with anything else, or end your turn - when it exits, the harness reads it for you with an (eval-status N) call carrying the rest of its output and its value: in this turn, after the calls running then, or, once the turn has ended, in a turn that wakes this session. (eval-status N) is one non-blocking look at the output since the last look, :shell-output in it what its (sh ...) child wrote since then. (list-evals) lists this image's evaluations, those other sessions started included. (eval-interrupt N) aborts one, (eval-interrupt N :force t) if it traps the abort. (eval-await N) parks until new output or the exit ((eval-await N :until-exit t) the exit alone), at most the calling snippet's yield_time_ms (10000 when unset), and only when a short wait beats ending the turn - never park a long window, and never poll with a shell sleep.
 
-sh. (sh \"cmd\") runs a string through bash -c where the machine has bash - /bin/sh otherwise, Git's sh.exe on Windows - in the session's folder ((sh \"cmd\" :directory \"dir\") elsewhere); a list is argv with no shell: (sh (list \"git\" \"commit\" \"-m\" ($ \"msg\"))). Stdin is empty, so a program that reads it sees end of file; a heredoc in the command feeds it. stdout and stderr arrive merged, with a final [exit N] line when the status is not 0; output past the capture limit is cut and says so. Any other child process reaches you only through Lisp streams - (sh ...), or :output :string or *standard-output* to run-program; this process's own file descriptors 0-2 go to a log neither you nor the operator sees, so never write to one, as (make-fd-stream 1) would.
+sh. (sh \"cmd\") runs a string through bash -c where the machine has bash - /bin/sh otherwise, Git's sh.exe on Windows - in the session's folder ((sh \"cmd\" :directory \"dir\") elsewhere); a list is argv with no shell: (sh (list \"git\" \"commit\" \"-m\" ($ \"msg\"))). Stdin is empty, so a program that reads it sees end of file; a heredoc in the command feeds it. stdout and stderr arrive merged, with a final [exit N] line when the status is not 0; output past the capture limit is cut and says so. Its only keywords are :directory and :timeout (seconds): there is no :limit, since the capture limit and the result cut already bound what you see - slice a long output with head, tail or sed -n. Any other child process reaches you only through Lisp streams - (sh ...), or :output :string or *standard-output* to run-program; this process's own file descriptors 0-2 go to a log neither you nor the operator sees, so never write to one, as (make-fd-stream 1) would.
 
 Literal text. strings {\"name\": \"...\"} beside the form, read inside it as ($ \"name\"), arrives exact, JSON escaping only; ($ \"name\") takes an entry's name, never the text itself. In a Lisp string a backslash only escapes the next character - \"\\n\" would read as n, \"\\|\" as | - so a snippet holding an escape the reader does not have is refused before anything runs. So text dense with backslashes, double quotes or newlines never tunnels through a Lisp string, nor through a shell heredoc written into the form: edit's old and new, file bodies, source, a note's or a prompt's body, and a whole shell command carrying a heredoc, (sh ($ \"script\")), all go in strings - or into the form itself as raw text: #>END ends its line, the text is every line after it up to one that starts with END, read exactly with nothing escaped, and what follows END on that line reads on: (write-file \"a.py\" #>PY, the file's lines, then PY).
 
@@ -2081,13 +2081,64 @@ error, as \"name key\" strings, bound per snippet by EVAL-FORM-PRINTED and
 named on the error text.")
 
 (defvar *arity-callee* nil
-  "(CONDITION . NAME): the innermost frame when CONDITION, an argument-count
-error, was signalled — the function that refused the call — captured
-before the stack unwinds, bound per snippet by EVAL-FORM-PRINTED. SBCL's
-report says \"invalid number of arguments: 4\" and nothing else; without
-this, the function that refused the call would be unnamed.")
+  "(CONDITION . TEXT): the innermost frame when CONDITION, an argument-count
+error or an unknown keyword, was signalled — the function that refused the
+call, and for an unknown keyword the keywords it takes — captured before the
+stack unwinds, bound per snippet by EVAL-FORM-PRINTED. SBCL's report says
+\"invalid number of arguments: 4\" or \"Unknown &KEY argument: :LIMIT\" and
+nothing else; without this, the function that refused the call would be
+unnamed.")
 
 (defun arity-error-p (condition)
+  "CONDITION refuses a call's arguments: a wrong count, or a keyword the
+callee does not take."
+  (or (typep condition 'sb-ext:unknown-keyword-argument)
+      (arg-count-error-p condition)))
+
+(defun accepted-keywords (name refused)
+  "The keywords function NAME takes, as \":a, :b\" (a key that is not a keyword
+as 'key), \"none\", or NIL when that is not known: NAME's lambda list
+unreadable, without &KEY, or open to any key (&ALLOW-OTHER-KEYS), or naming
+REFUSED itself — then the frame read is not the function that refused it,
+as when a local function is compiled into its caller. SBCL's report names
+only the refused keyword, so a caller that guessed one has nothing to go on
+unless the keys it may use are named."
+  (let ((lambda-list (and (symbolp name) (fboundp name)
+                          (ignore-errors
+                           (uiop:symbol-call :sb-introspect :function-lambda-list name)))))
+    (when (and (consp lambda-list)
+               (member '&key lambda-list)
+               (not (member '&allow-other-keys lambda-list)))
+      ;; Each key as (NAME . KEYWORDP): a plain or (VAR INIT) parameter is
+      ;; the keyword of its name; ((KEY VAR) INIT) is KEY, any symbol.
+      (let ((keys (loop for item in (rest (member '&key lambda-list))
+                        until (member item lambda-list-keywords)
+                        collect (let ((spec (if (consp item) (first item) item)))
+                                  (if (consp spec)
+                                      (cons (symbol-name (first spec)) (keywordp (first spec)))
+                                      (cons (symbol-name spec) t))))))
+        (unless (and (symbolp refused)
+                     (find-if (lambda (key)
+                                (and (string= (car key) (symbol-name refused))
+                                     (eq (cdr key) (keywordp refused))))
+                              keys))
+          (if keys
+              (format nil "~{~a~^, ~}"
+                      (mapcar (lambda (key)
+                                (format nil "~a~(~a~)" (if (cdr key) ":" "'") (car key)))
+                              keys))
+              "none"))))))
+
+(defun signalling-frame-name-p (name)
+  "Whether NAME, a frame's function, is NOTE-ARITY-CALLEE itself or one of the
+frames that signal a condition from Lisp -- ERROR, CERROR, SIGNAL and SBCL's
+%SIGNAL -- rather than the function that refused a call."
+  (and name (symbolp name)
+       (member name (list 'note-arity-callee 'error 'cerror 'signal
+                          (find-symbol "%SIGNAL" '#:sb-kernel)))
+       t))
+
+(defun arg-count-error-p (condition)
   (and (typep condition 'sb-int:simple-program-error)
        (let ((control (simple-condition-format-control condition)))
          (and (stringp control)
@@ -2105,9 +2156,19 @@ is still on the stack. Declines, so the snippet's own arm still answers."
                    (sb-debug:map-backtrace
                     (lambda (frame)
                       (when-let (name (ignore-errors (sb-debug::frame-call frame)))
-                        (return-from found
-                          (nlk:clip (let ((*print-pretty* nil)) (princ-to-string name)) 90))))
-                    :count 3)
+                        ;; A condition signalled from Lisp, (error 'x ...), has
+                        ;; this handler and the signalling frames above the
+                        ;; function that signalled it.
+                        (unless (signalling-frame-name-p name)
+                          (return-from found
+                            (nlk:clip (let ((*print-pretty* nil))
+                                        (format nil "~a~@[, whose keywords are ~a~]"
+                                                (princ-to-string name)
+                                                (and (typep condition 'sb-ext:unknown-keyword-argument)
+                                                     (accepted-keywords
+                                                      name (sb-ext:unknown-keyword-argument-name condition)))))
+                                      160)))))
+                    :count 8)
                    nil))))))
 
 (defun unwind-snippet-hooks (before)
@@ -2169,7 +2230,7 @@ value — the caller prints it, briefly or in full by its place in the snippet."
                                      (pushnew (princ-to-string w) warnings :test #'string=)))
                                  (when (find-restart 'muffle-warning w)
                                    (muffle-warning w))))
-                             (sb-int:simple-program-error #'note-arity-callee))
+                             (program-error #'note-arity-callee))
                           ;; What the form did beyond the image, read off
                           ;; its own thread: the watch rule (WATCHED-TEXT).
                           (let ((io (thread-io-calls)))
